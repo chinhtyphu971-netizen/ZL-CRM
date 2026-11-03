@@ -2,8 +2,12 @@
  * zalo-history-backfill.ts — initial history seeding for fresh accounts.
  *
  * On first connect (or via manual sync endpoint) fetches:
- *   - All friends → upsert contacts (no message history; zca-js has no 1-1 history API)
- *   - All groups → upsert contact-stub + conversation + recent message history
+ *   - All friends → upsert contacts
+ *   - All groups → recent history via REST getGroupChatHistory (when Zalo still serves it)
+ *   - DM + group history via websocket requestOldMessages (cmd 510/511), same as Zalo Web
+ *
+ * Note: Zalo only returns history its server keeps for web sessions. Messages that
+ * live only on the phone (never synced to Zalo PC/Web) cannot be fetched here.
  *
  * Idempotent: re-running is safe — message-handler dedup guards prevent duplicates.
  * Fire-and-forget callable: errors are logged, not propagated.
@@ -18,6 +22,29 @@ const MAX_GROUPS = 50;
 const MESSAGES_PER_GROUP = 50;
 const DM_MAX_PAGES = 50;
 const DM_PAGE_TIMEOUT_MS = 15_000;
+const GROUP_INFO_BATCH = 50;
+// Right after QR login the websocket may not be open / keyed yet, and Zalo can
+// answer the very first request with an empty page. Retry the first page a few times.
+const FIRST_PAGE_RETRIES = 3;
+const FIRST_PAGE_RETRY_DELAY_MS = 4_000;
+const LISTENER_READY_TIMEOUT_MS = 30_000;
+
+/**
+ * Wait until the zca-js listener websocket is open AND has received its cipher key
+ * (needed to decode old_messages payloads). Resolves false on timeout.
+ */
+async function waitForListenerReady(api: any, accountId: string): Promise<boolean> {
+  const deadline = Date.now() + LISTENER_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const listener = api?.listener;
+    if (listener?.ws?.readyState === 1 && listener?.cipherKey) return true;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  logger.warn(`[backfill:${accountId}] Listener not ready after ${LISTENER_READY_TIMEOUT_MS}ms — requesting history anyway`);
+  return false;
+}
+
+interface GroupMeta { name?: string; avatar?: string; membersCount?: number; }
 
 /**
  * Multi-cursor strategy ported from openzca CLI `getRecentPageCursors`.
@@ -48,12 +75,14 @@ function pickNextCursors(messages: any[]): string[] {
 
 // ThreadType from zca-js: 0 = User (DM), 1 = Group
 const THREAD_TYPE_USER = 0;
+const THREAD_TYPE_GROUP = 1;
 
 export interface BackfillResult {
   friendsSynced: number;
   groupsSynced: number;
   messagesBackfilled: number;
   dmPagesRequested: number;
+  groupPagesRequested: number;
   errors: number;
 }
 
@@ -64,12 +93,19 @@ interface PumpStats { pagesRequested: number; messagesInserted: number; messages
  * incoming batch via `handleIncomingMessage`. This bypasses the main listener's
  * `old_messages` handler so insertion is deterministic and counted.
  */
-async function pumpOldMessages(api: any, threadType: number, accountId: string): Promise<PumpStats> {
+async function pumpOldMessages(
+  api: any,
+  threadType: number,
+  accountId: string,
+  groupMeta?: Map<string, GroupMeta>,
+): Promise<PumpStats> {
   return new Promise((resolve) => {
     const stats: PumpStats = { pagesRequested: 0, messagesInserted: 0, messagesReceived: 0 };
     const requestedCursors = new Set<string>();
+    const threadTypeLabel = threadType === THREAD_TYPE_USER ? 'user' : 'group';
     let timer: ReturnType<typeof setTimeout> | null = null;
     let finished = false;
+    let emptyFirstPages = 0;
 
     const finish = () => {
       if (finished) return;
@@ -102,11 +138,21 @@ async function pumpOldMessages(api: any, threadType: number, accountId: string):
     const onPage = async (messages: any[], type: number) => {
       if (finished) return;
       if (type !== threadType) return;
-      if (!Array.isArray(messages) || messages.length === 0) { finish(); return; }
+      if (!Array.isArray(messages) || messages.length === 0) {
+        // Empty first page right after login is often a timing artefact — retry it.
+        if (stats.messagesReceived === 0 && emptyFirstPages < FIRST_PAGE_RETRIES) {
+          emptyFirstPages++;
+          logger.info(`[backfill:${accountId}] Empty first ${threadTypeLabel} page — retry ${emptyFirstPages}/${FIRST_PAGE_RETRIES}`);
+          if (timer) clearTimeout(timer);
+          setTimeout(() => { if (!finished && !requestPage(null)) finish(); }, FIRST_PAGE_RETRY_DELAY_MS);
+          return;
+        }
+        finish();
+        return;
+      }
 
-      const threadTypeLabel = threadType === THREAD_TYPE_USER ? 'user' : 'group';
       stats.messagesReceived += messages.length;
-      logger.info(`[backfill:${accountId}] DM page received: ${messages.length} message(s) (received total=${stats.messagesReceived})`);
+      logger.info(`[backfill:${accountId}] ${threadTypeLabel} page received: ${messages.length} message(s) (received total=${stats.messagesReceived})`);
 
       // Persist each message directly. Use senderUid as fallback threadId for
       // self messages, since Zalo's payload puts the peer in idTo.
@@ -122,6 +168,7 @@ async function pumpOldMessages(api: any, threadType: number, accountId: string):
             typeof rawContent === 'string' ? rawContent : JSON.stringify(rawContent || '');
           const contentType = detectContentType(m?.data?.msgType, rawContent);
           const album = extractAlbumInfo(contentType, rawContent);
+          const meta = threadType === THREAD_TYPE_GROUP ? groupMeta?.get(threadId) : undefined;
 
           const inserted = await handleIncomingMessage({
             accountId,
@@ -133,7 +180,10 @@ async function pumpOldMessages(api: any, threadType: number, accountId: string):
             timestamp: parseInt(m?.data?.ts || String(Date.now())),
             isSelf,
             threadId,
-            threadType: threadTypeLabel as 'user' | 'group',
+            threadType: threadTypeLabel,
+            groupName: meta?.name,
+            groupAvatarUrl: meta?.avatar,
+            groupMembersCount: meta?.membersCount,
             attachments: [],
             quote: m?.data?.quote,
             albumKey: album.albumKey,
@@ -143,7 +193,7 @@ async function pumpOldMessages(api: any, threadType: number, accountId: string):
           });
           if (inserted) stats.messagesInserted++;
         } catch (err) {
-          logger.warn(`[backfill:${accountId}] DM insert failed:`, err);
+          logger.warn(`[backfill:${accountId}] ${threadTypeLabel} insert failed:`, err);
         }
       }
 
@@ -170,6 +220,7 @@ export async function backfillAccountHistory(api: any, accountId: string): Promi
     groupsSynced: 0,
     messagesBackfilled: 0,
     dmPagesRequested: 0,
+    groupPagesRequested: 0,
     errors: 0,
   };
 
@@ -232,27 +283,46 @@ export async function backfillAccountHistory(api: any, accountId: string): Promi
   }
 
   // ── 2. Sync groups → conversations + history ───────────────────────────
-  let groups: any[] = [];
+  // zca-js 2.x getAllGroups returns { version, gridVerMap: { [groupId]: version } } —
+  // only ids. Names/avatars come from getGroupInfo (max 50 ids per call).
+  let groupIds: string[] = [];
+  const groupMeta = new Map<string, GroupMeta>();
   try {
     const groupsRaw = await api.getAllGroups();
-    // getAllGroups returns { gridVerMap: {...}, gridInfoMap: { groupId: { groupInfo... } } }
-    const gridInfoMap = groupsRaw?.gridInfoMap || groupsRaw || {};
-    groups = Object.values(gridInfoMap) as any[];
+    groupIds = Object.keys(groupsRaw?.gridVerMap || {});
   } catch (err) {
     result.errors++;
     logger.warn(`[backfill:${accountId}] getAllGroups failed:`, err);
-    return result;
   }
 
-  const groupSubset = groups.slice(0, MAX_GROUPS);
-  for (const group of groupSubset) {
-    const groupId = String(group?.groupId || group?.id || '');
-    if (!groupId) continue;
+  for (let i = 0; i < groupIds.length; i += GROUP_INFO_BATCH) {
+    const batch = groupIds.slice(i, i + GROUP_INFO_BATCH);
+    try {
+      const info = await api.getGroupInfo(batch);
+      for (const [id, g] of Object.entries<any>(info?.gridInfoMap || {})) {
+        groupMeta.set(id, {
+          name: g?.name || undefined,
+          avatar: g?.avt || g?.fullAvt || undefined,
+          membersCount: typeof g?.totalMember === 'number' ? g.totalMember : undefined,
+        });
+      }
+    } catch (err) {
+      logger.warn(`[backfill:${accountId}] getGroupInfo batch failed:`, err);
+    }
+  }
+  logger.info(`[backfill:${accountId}] Found ${groupIds.length} group(s), metadata for ${groupMeta.size}`);
+
+  // REST group history: stop calling it after a 404 (endpoint retired for this
+  // session) — the websocket pump in step 4 covers group history instead.
+  let groupRestAvailable = true;
+  for (const groupId of groupIds.slice(0, MAX_GROUPS)) {
+    if (!groupRestAvailable) break;
+    const meta = groupMeta.get(groupId);
 
     try {
-      const groupName = group?.name || group?.groupName || 'Nhóm';
-      const groupAvatar = group?.avt || group?.avatar || null;
-      const membersCount = group?.totalMember ?? group?.memberCount ?? null;
+      const groupName = meta?.name || 'Nhóm';
+      const groupAvatar = meta?.avatar || null;
+      const membersCount = meta?.membersCount ?? null;
 
       const history = await api.getGroupChatHistory(groupId, MESSAGES_PER_GROUP);
       const messages = history?.groupMsgs || history?.data?.groupMsgs || [];
@@ -298,28 +368,46 @@ export async function backfillAccountHistory(api: any, accountId: string): Promi
       result.groupsSynced++;
     } catch (err) {
       result.errors++;
-      logger.warn(`[backfill:${accountId}] Group ${groupId} history fetch failed:`, err);
+      const status = (err as any)?.code ?? (err as any)?.response?.status;
+      if (status === 404 || /status code 404/.test(String((err as any)?.message || err))) {
+        groupRestAvailable = false;
+        logger.warn(`[backfill:${accountId}] getGroupChatHistory returned 404 — skipping REST group history, using websocket instead`);
+      } else {
+        logger.warn(`[backfill:${accountId}] Group ${groupId} history fetch failed:`, err);
+      }
     }
   }
 
-  // ── 3. DM history via requestOldMessages pagination ────────────────────
-  // Zalo pushes batches via `old_messages` event; the listener handler in
-  // zalo-listener-factory persists them. We only drive cursor pagination.
+  // ── 3+4. DM + group history via requestOldMessages pagination ──────────
+  // Zalo pushes batches via `old_messages` event (cmd 510 = DM, 511 = group).
+  // Wait for the websocket to be open and keyed first — requesting too early
+  // (right after QR login) gets an empty page.
   let dmReceived = 0;
-  try {
-    if (api?.listener?.requestOldMessages) {
+  let groupReceived = 0;
+  if (api?.listener?.requestOldMessages) {
+    await waitForListenerReady(api, accountId);
+    try {
       const stats = await pumpOldMessages(api, THREAD_TYPE_USER, accountId);
       result.dmPagesRequested = stats.pagesRequested;
       dmReceived = stats.messagesReceived;
       // Count by raw received — main listener may win the insert race, but
       // the message still ends up in DB. messagesInserted alone undercounts.
       result.messagesBackfilled += stats.messagesReceived;
-    } else {
-      logger.warn(`[backfill:${accountId}] api.listener.requestOldMessages unavailable — skipping DM backfill`);
+    } catch (err) {
+      result.errors++;
+      logger.warn(`[backfill:${accountId}] DM pump failed:`, err);
     }
-  } catch (err) {
-    result.errors++;
-    logger.warn(`[backfill:${accountId}] DM pump failed:`, err);
+    try {
+      const stats = await pumpOldMessages(api, THREAD_TYPE_GROUP, accountId, groupMeta);
+      result.groupPagesRequested = stats.pagesRequested;
+      groupReceived = stats.messagesReceived;
+      result.messagesBackfilled += stats.messagesReceived;
+    } catch (err) {
+      result.errors++;
+      logger.warn(`[backfill:${accountId}] Group pump failed:`, err);
+    }
+  } else {
+    logger.warn(`[backfill:${accountId}] api.listener.requestOldMessages unavailable — skipping websocket history`);
   }
 
   // Sanity check: verify what actually landed in DB for this account
@@ -332,7 +420,8 @@ export async function backfillAccountHistory(api: any, accountId: string): Promi
 
   logger.info(
     `[backfill:${accountId}] Done — friends=${result.friendsSynced} groups=${result.groupsSynced} ` +
-    `dmReceived=${dmReceived} dmPages=${result.dmPagesRequested} errors=${result.errors} ` +
+    `dmReceived=${dmReceived} dmPages=${result.dmPagesRequested} ` +
+    `groupReceived=${groupReceived} groupPages=${result.groupPagesRequested} errors=${result.errors} ` +
     `| DB now has ${dbCounts[0]} conversation(s), ${dbCounts[1]} message(s) for this account`,
   );
   return result;
